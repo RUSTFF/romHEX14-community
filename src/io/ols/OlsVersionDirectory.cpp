@@ -23,6 +23,36 @@ OlsVersionDirectory OlsVersionDirectory::parse(const QByteArray &fileData,
     const qsizetype anchorPos = fileData.indexOf(needle, 0);
 
     if (anchorPos < 0 || anchorPos >= scanLimit) {
+        // WinOLS 5 (OLS 5.0, format >= 800) no longer writes the fixed M1
+        // magic after the directory header.  The header triple
+        // (numVersions-1, versionDataStart, versionRecordSize) is still
+        // present in the preamble, so locate it by requiring that it
+        // describes the file tail exactly.
+        const qsizetype fsz = fileData.size();
+        const qsizetype limit = qMin(fsz - 12, static_cast<qsizetype>(0x10000));
+        const auto *base = reinterpret_cast<const uchar *>(fileData.constData());
+        for (qsizetype o = 0x18; o < limit; ++o) {
+            const uint32_t nm1 = qFromLittleEndian<uint32_t>(base + o);
+            if (nm1 >= 64) continue;
+            const uint32_t vs = qFromLittleEndian<uint32_t>(base + o + 4);
+            const uint32_t rs = qFromLittleEndian<uint32_t>(base + o + 8);
+            if (rs < 0x1000 || vs < 0x18 || vs >= static_cast<uint32_t>(fsz))
+                continue;
+            const qsizetype end = static_cast<qsizetype>(vs) + 4
+                                + static_cast<qsizetype>(rs) * (nm1 + 1);
+            if (end != fsz) continue;
+            dir.numVersions       = nm1 + 1;
+            dir.versionDataStart  = vs;
+            dir.versionRecordSize = rs;
+            dir.fromSizeScan      = true;
+            dir.versionSlots.resize(static_cast<int>(dir.numVersions));
+            for (uint32_t i = 0; i < dir.numVersions; ++i) {
+                auto &slot = dir.versionSlots[static_cast<int>(i)];
+                slot.index = static_cast<int>(i);
+                slot.slotFileOffset = dir.slotOffset(static_cast<int>(i));
+            }
+            return dir;
+        }
         if (warnings)
             warnings->append(
                 QStringLiteral("M1 anchor 0x42007899 not found in preamble"));

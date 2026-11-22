@@ -23,6 +23,7 @@ static constexpr int DATA_START_PRE_OFFSET = 26;
 static constexpr uint32_t MODERN_FRAMING_BYTES = 76;
 static constexpr uint32_t MAX_SEG_SIZE = 16u * 1024u * 1024u;
 static constexpr uint32_t MODERN_FMTVER_THRESHOLD = 200;
+static constexpr uint32_t WINOLS5_FMTVER_THRESHOLD = 800;
 
 static constexpr uint32_t OLD_FMT_MAX_VERSIONS = 64;
 static constexpr uint32_t OLD_FMT_MAX_REC_SIZE = 64u * 1024u * 1024u;
@@ -232,6 +233,31 @@ QVector<OlsRomResult> OlsRomExtractor::extractAll(const QByteArray &fileData)
         fmtVer = peekU32(fileData, 0x10);
 
     QVector<OlsSegment> rawSegs;
+
+    // WinOLS 5: each version is stored as a plain image of
+    // versionRecordSize bytes at the end of the file.  The FADECAFE /
+    // CAFEAFFE scan must not run here, because Bosch calibration headers
+    // inside the ROM contain the same sentinels and would be mistaken for
+    // OLS framing (all versions then collapse into one).
+    if (fmtVer >= WINOLS5_FMTVER_THRESHOLD) {
+        const auto dir = OlsVersionDirectory::parse(fileData);
+        if (dir.fromSizeScan && dir.numVersions > 0) {
+            QVector<OlsRomResult> versions = oldFormatVersionsFromDirectory(fileData);
+            if (!versions.isEmpty()) {
+                for (auto &ver : versions) {
+                    for (int i = 0; i < ver.segments.size(); ++i) {
+                        auto &seg = ver.segments[i];
+                        seg.segmentIndex = i;
+                        seg.flashBase = 0;      // map addresses are image offsets
+                        seg.framingBytes = 0;
+                        seg.data = fileData.mid(seg.dataStart, seg.flashSize);
+                    }
+                    ver.assembledRom = assemble(ver.segments);
+                }
+                return versions;
+            }
+        }
+    }
 
     if (fmtVer >= MODERN_FMTVER_THRESHOLD) {
         rawSegs = findAllSegments(fileData);

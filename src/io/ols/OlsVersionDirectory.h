@@ -25,6 +25,9 @@ struct OlsVersionDirectory {
     uint32_t numVersions       = 0;
     uint32_t versionDataStart  = 0;
     uint32_t versionRecordSize = 0;
+    // true when the header was located by the WinOLS 5 fallback scan
+    // (no M1 anchor; triple validated against the exact file size).
+    bool     fromSizeScan      = false;
 
     QVector<OlsVersionSlot> versionSlots;
 

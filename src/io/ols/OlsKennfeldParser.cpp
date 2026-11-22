@@ -7,6 +7,7 @@
 
 #include "OlsKennfeldParser.h"
 
+#include <QHash>
 #include <QRegularExpression>
 #include <QSet>
 #include <QStringDecoder>
@@ -846,6 +847,225 @@ QVector<MapInfo> OlsKennfeldParser::parseIntern(const QByteArray &internPayload,
         ++off;
     }
 
+    return maps;
+}
+
+
+
+// ─── WinOLS 5 record layout ────────────────────────────────────────────────
+//
+// Offsets are relative to the first byte after the length-prefixed name
+// (u32 len + len bytes, no terminator):
+//   +0x14 u32  cell data type (1 u8, 2 u16 BE, 3 u16 LE, 4/5 u32, 6/7 float…)
+//   +0x18 u32  bytes per cell
+//   +0x9A u8   cell signed flag
+//   +0x9D u32  column count (X)          +0xA1 u32  row count (Y)
+// followed by optional strings and the data block
+//   f64 factor, f64 offset, u32 romStart, u32 romEnd
+// and two axis blocks (X first, then Y), each preceded by its optional
+// name/unit strings and f64 factor, f64 offset:
+//   u32 1, u32 romAddr, u32 dataType, u32 bytesPerPoint, u32 0x0A, …
+//   +42 u8 signed flag
+// Cell data is stored X-fastest (row by row).
+
+namespace {
+
+int v5BytesFromDataType(uint32_t dt)
+{
+    switch (dt) {
+    case 1: case 8: case 9:             return 1;
+    case 2: case 3:                     return 2;
+    case 4: case 5: case 6: case 7:     return 4;
+    case 10: case 11: case 12: case 13: return 8;
+    default:                            return 0;
+    }
+}
+
+bool v5IsBigEndian(uint32_t dt)
+{
+    return dt == 2 || dt == 4 || dt == 6 || dt == 10 || dt == 12;
+}
+
+bool v5Printable(const QByteArray &d, qsizetype off, int len)
+{
+    if (len <= 0 || off + len > d.size()) return false;
+    for (int i = 0; i < len; ++i) {
+        const auto b = static_cast<uint8_t>(d.at(off + i));
+        if (b < 0x20 || b == 0x7F) return false;
+    }
+    return true;
+}
+
+// Length-prefixed strings in [from, to): first is the label, last the unit.
+QStringList v5Strings(const QByteArray &d, qsizetype from, qsizetype to)
+{
+    QStringList out;
+    qsizetype i = from;
+    while (i + 4 <= to) {
+        const uint32_t L = OlsKennfeldParser::peekU32(d, i);
+        if (L >= 1 && L <= 120 && i + 4 + qsizetype(L) <= to
+            && v5Printable(d, i + 4, int(L))) {
+            out.append(decodeOlsString(d.constData() + i + 4, int(L)));
+            i += 4 + L;
+        } else {
+            ++i;
+        }
+    }
+    return out;
+}
+
+bool v5FiniteScale(double v)
+{
+    return std::isfinite(v) && std::fabs(v) < 1e12;
+}
+
+} // namespace
+
+QVector<MapInfo> OlsKennfeldParser::parseAllWinOls5(const QByteArray &data,
+                                                    qsizetype regionEnd,
+                                                    uint32_t romSize,
+                                                    QStringList *warnings)
+{
+    QVector<MapInfo> maps;
+    QSet<QString> seenKeys;
+    QHash<QString, int> nameCount;
+    const uint32_t addrLimit = romSize ? romSize : 0x10000000u;
+    const qsizetype end = qMin(regionEnd, data.size());
+
+    qsizetype off = 0x18;
+    while (off + 4 + 0x130 < end) {
+        const uint32_t L = peekU32(data, off);
+        if (L < 1 || L > 200 || !v5Printable(data, off + 4, int(L))) { ++off; continue; }
+        const qsizetype b = off + 4 + L;
+        if (b + 0x130 > end) { ++off; continue; }
+
+        const uint32_t dt  = peekU32(data, b + 0x14);
+        const uint32_t bpc = peekU32(data, b + 0x18);
+        const int dtBytes = v5BytesFromDataType(dt);
+        const uint8_t sgn = static_cast<uint8_t>(data.at(b + 0x9A));
+        const uint32_t nx = peekU32(data, b + 0x9D);
+        const uint32_t ny = peekU32(data, b + 0xA1);
+        if (dtBytes == 0 || (bpc != 1 && bpc != 2 && bpc != 4 && bpc != 8)
+            || sgn > 1 || nx < 1 || nx > 256 || ny < 1 || ny > 256) {
+            ++off; continue;
+        }
+
+        // Data block: f64 factor, f64 offset, u32 start, u32 end.
+        const qsizetype cells = qsizetype(nx) * ny;
+        qsizetype q = -1;
+        for (qsizetype t = b + 0xA5; t + 8 <= qMin(end, b + 0x400); ++t) {
+            const uint32_t st = peekU32(data, t), en = peekU32(data, t + 4);
+            if (st == 0 || st >= addrLimit || en <= st || en > addrLimit) continue;
+            const qsizetype span = qsizetype(en) - st;
+            if (span != cells * dtBytes && span != cells * 2 && span != cells * 4)
+                continue;
+            if (!v5FiniteScale(peekF64(data, t - 16)) || !v5FiniteScale(peekF64(data, t - 8)))
+                continue;
+            q = t;
+            break;
+        }
+        if (q < 0) { ++off; continue; }
+
+        const uint32_t romStart = peekU32(data, q);
+        const double factor = peekF64(data, q - 16);
+        const double offsetV = peekF64(data, q - 8);
+        const QStringList valStrs = v5Strings(data, b + 0xA5, q - 16);
+
+        // Axis blocks.
+        struct Ax { uint32_t addr, dt, bytes; bool sgn; double f, o; QStringList strs; };
+        QVector<Ax> axes;
+        qsizetype prev = q + 8, p = q + 8;
+        const qsizetype axLimit = qMin(end - 48, q + 8 + 0x300);
+        while (p < axLimit && axes.size() < 2) {
+            const uint32_t a = peekU32(data, p + 4), adt = peekU32(data, p + 8),
+                           ab = peekU32(data, p + 12);
+            if (peekU32(data, p) == 1 && a > 0 && a < addrLimit
+                && v5BytesFromDataType(adt) != 0 && (ab == 1 || ab == 2 || ab == 4 || ab == 8)
+                && peekU32(data, p + 16) == 0x0A) {
+                Ax ax;
+                ax.addr = a; ax.dt = adt; ax.bytes = ab;
+                ax.sgn = static_cast<uint8_t>(data.at(p + 42)) != 0;
+                ax.f = peekF64(data, p - 16); ax.o = peekF64(data, p - 8);
+                if (!v5FiniteScale(ax.f) || ax.f == 0.0) ax.f = 1.0;
+                if (!v5FiniteScale(ax.o)) ax.o = 0.0;
+                ax.strs = v5Strings(data, prev, p - 16);
+                axes.append(ax);
+                prev = p + 20;
+                p += 20;
+            } else {
+                ++p;
+            }
+        }
+        const qsizetype recordNext = axes.isEmpty() ? q + 8 : prev;
+
+        QString name = decodeOlsString(data.constData() + off + 4, int(L));
+        const QString key = QStringLiteral("%1/%2/%3").arg(romStart).arg(nx).arg(ny);
+        if (seenKeys.contains(key)) {    // second (duplicate) map list
+            off = recordNext;
+            continue;
+        }
+        seenKeys.insert(key);
+
+        MapInfo mi;
+        const int dup = nameCount.value(name, 0);
+        nameCount[name] = dup + 1;
+        mi.id = name;
+        mi.name = name;
+        if (name.startsWith(QStringLiteral("Kennfeld \"")) || dup > 0) {
+            // WinOLS placeholder names repeat hundreds of times; make them
+            // unique and sortable by appending the ROM address.
+            const QString hex = QString::number(romStart, 16).toUpper()
+                                    .rightJustified(6, QLatin1Char('0'));
+            mi.name = name + QStringLiteral(" @") + hex;
+        }
+        mi.markerPos = int(off);
+        mi.rawAddress = romStart;
+        mi.address = romStart;
+        mi.dimensions = { int(nx), int(ny) };
+        mi.cellDataType = dt;
+        mi.cellBigEndian = v5IsBigEndian(dt);
+        mi.dataSize = dtBytes;
+        mi.dataSigned = (sgn != 0);
+        mi.length = int(cells * dtBytes);
+        mi.columnMajor = false;
+        mi.linkConfidence = 100;
+        mi.type = (nx <= 1 && ny <= 1) ? QStringLiteral("VALUE")
+                : (ny <= 1 ? QStringLiteral("CURVE") : QStringLiteral("MAP"));
+        const double fac = (factor == 0.0) ? 1.0 : factor;
+        if (fac != 1.0 || offsetV != 0.0) {
+            mi.hasScaling = true;
+            mi.scaling.type = CompuMethod::Type::Linear;
+            mi.scaling.linA = fac;
+            mi.scaling.linB = offsetV;
+        }
+        if (valStrs.size() >= 2) mi.scaling.unit = valStrs.last();
+        if (!valStrs.isEmpty()) mi.description = valStrs.first();
+
+        auto fillAxis = [](AxisInfo &out, const Ax &ax, int count) {
+            out.hasPtsAddress = true;
+            out.ptsAddress = ax.addr;
+            out.ptsCount = count;
+            out.ptsDataType = ax.dt;
+            out.ptsBigEndian = v5IsBigEndian(ax.dt);
+            out.ptsSigned = ax.sgn;
+            out.ptsDataSize = v5BytesFromDataType(ax.dt);
+            if (!ax.strs.isEmpty()) out.inputName = ax.strs.first();
+            out.hasScaling = (ax.f != 1.0 || ax.o != 0.0);
+            out.scaling.type = CompuMethod::Type::Linear;
+            out.scaling.linA = ax.f;
+            out.scaling.linB = ax.o;
+            if (ax.strs.size() >= 2) out.scaling.unit = ax.strs.last();
+        };
+        if (axes.size() >= 1 && nx > 1) fillAxis(mi.xAxis, axes[0], int(nx));
+        if (axes.size() >= 2 && ny > 1) fillAxis(mi.yAxis, axes[1], int(ny));
+
+        maps.append(mi);
+        off = recordNext;
+    }
+
+    if (warnings && !maps.isEmpty())
+        warnings->append(OlsKennfeldParser::tr("WinOLS 5 layout: %1 maps parsed")
+                             .arg(maps.size()));
     return maps;
 }
 

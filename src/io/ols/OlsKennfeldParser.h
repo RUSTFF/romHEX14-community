@@ -35,6 +35,14 @@ public:
                                         int schema,
                                         QStringList *warnings = nullptr);
 
+    // WinOLS 5 (format >= 800) record layout: the map name comes first and
+    // the type/geometry/address fields sit at fixed offsets behind it.
+    // romSize (0 = unknown) bounds plausible ROM addresses.
+    static QVector<MapInfo> parseAllWinOls5(const QByteArray &data,
+                                            qsizetype regionEnd,
+                                            uint32_t romSize,
+                                            QStringList *warnings = nullptr);
+
     static QPair<qsizetype, qsizetype> findMapRegion(const QByteArray &data,
                                                       int schema);
 

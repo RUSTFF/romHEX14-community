@@ -62,8 +62,20 @@ OlsImportResult OlsImporter::importFromBytes(const QByteArray &fileData)
     auto [mapRegionStart, mapRegionEnd] =
         OlsKennfeldParser::findMapRegion(fileData, schema);
 
-    QVector<MapInfo> maps = OlsKennfeldParser::parseAll(
-        fileData, mapRegionStart, mapRegionEnd, schema, &result.warnings);
+    QVector<MapInfo> maps;
+    if (fmtVer >= 800) {
+        // WinOLS 5 project: map records use a different layout and the
+        // version images sit at the end of the file (see OlsVersionDirectory).
+        const auto dir = OlsVersionDirectory::parse(fileData);
+        const qsizetype regionEnd = (dir.fromSizeScan && dir.versionDataStart > 0)
+            ? static_cast<qsizetype>(dir.versionDataStart) : fileData.size();
+        const uint32_t romSize = dir.fromSizeScan ? dir.versionRecordSize : 0;
+        maps = OlsKennfeldParser::parseAllWinOls5(fileData, regionEnd, romSize,
+                                                  &result.warnings);
+    }
+    if (maps.isEmpty())
+        maps = OlsKennfeldParser::parseAll(
+            fileData, mapRegionStart, mapRegionEnd, schema, &result.warnings);
 
 
     QStringList versionNames;
