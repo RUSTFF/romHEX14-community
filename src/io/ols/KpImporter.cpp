@@ -6,6 +6,7 @@
 
 #include "KpImporter.h"
 #include "ZipDecompressor.h"
+#include "WinOls5MapObject.h"
 
 #include <QtEndian>
 #include <QHash>
@@ -2539,7 +2540,9 @@ KpImportResult KpImporter::importFromBytes(const QByteArray &fileData,
     // Folder tree lives in the trailing metadata (after the ZIP), not in
     // `intern` — parse it so maps can be grouped like WinOLS shows them.
     QHash<uint32_t, KpFolder> folders;
-    if (result.formatVersion < 597) {
+    if (result.formatVersion >= 839) {
+        // WinOLS 5: folder table framed by per-file markers, read below.
+    } else if (result.formatVersion < 597) {
         folders = parseKpFolderTableLegacy(fileData, archiveEnd, result.formatVersion,
                                            &result.folders, &result.warnings);
     } else if (result.formatVersion < 750) {
@@ -2665,6 +2668,52 @@ KpImportResult KpImporter::importFromBytes(const QByteArray &fileData,
                             &result.warnings, false, true);
         break;
     default:
+        if (result.formatVersion >= 839 && result.formatVersion <= 900) {
+            // WinOLS 5 map packs: KpMapObject grammar shared with .ols files.
+            const uint32_t gateVer = qMin<uint32_t>(result.formatVersion, 859);
+            QVector<Wo5MapObject> objs;
+            QVector<Wo5Folder> wfolders;
+            QString err;
+            qsizetype ip = 0;
+            if (!wo5::readMapList(intern, ip, gateVer, objs, &err) || ip != intern.size()) {
+                result.error = KpImporter::tr("Schema-%1 map list: %2")
+                                   .arg(result.formatVersion)
+                                   .arg(err.isEmpty() ? QStringLiteral("trailing bytes") : err);
+                return result;
+            }
+            qsizetype fp = archiveEnd;
+            QHash<uint32_t, QString> wpaths;
+            if (wo5::readFolderTable(fileData, fp, gateVer, wfolders, nullptr, nullptr, &err)) {
+                wpaths = wo5::folderPaths(wfolders);
+                for (const auto &f : wfolders) {
+                    KpFolderRecord rec;
+                    rec.id = f.id; rec.parentId = f.parentId; rec.name = f.name;
+                    rec.value302a = f.value302a;
+                    result.folders.append(rec);
+                }
+            } else {
+                result.warnings.append(KpImporter::tr("Folder table not readable: %1").arg(err));
+            }
+            for (const auto &o : objs) {
+                MapInfo mi;
+                if (!wo5::toMapInfo(o, wpaths, mi)) continue;
+                uint32_t off = 0;
+                if (o.end > o.start
+                    && normalizeKpAddress(o.start, o.end, o.imageSize, baseAddress, romSize, &off)) {
+                    mi.rawAddress = (baseAddress != 0 && off == o.start) ? baseAddress + off : o.start;
+                    mi.address = off;
+                }
+                for (AxisInfo *ax : { &mi.xAxis, &mi.yAxis }) {
+                    if (!ax->hasPtsAddress) continue;
+                    uint32_t aoff = 0;
+                    if (normalizeKpAxisAddress(ax->ptsAddress, ax->ptsCount, ax->ptsDataSize,
+                                               baseAddress, romSize, &aoff))
+                        ax->ptsAddress = aoff;
+                }
+                result.maps.append(mi);
+            }
+            break;
+        }
         if (result.formatVersion < 6 || result.formatVersion > 834) {
             result.error = KpImporter::tr(
                 "Unsupported KP schema %1: the OLS format accepts schemas 6 through 834")
